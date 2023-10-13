@@ -30,7 +30,7 @@ __all__ = ['Dict', 'lookup_nn', 'reduce_loss_dict', 'tensor_to', 'to_device', 'a
            'ensure_num_tuple', 'get_nd_conv', 'get_nd_linear', 'get_nd_dropout', 'get_nd_max_pool', 'get_nd_batchnorm',
            'get_warmup_factor', 'print_to_file', 'NormProxy', 'num_bytes', 'from_h5', 'update_dict_',
            'get_tiling_slices', 'get_nn', 'copy_script', 'hash_file', 'append_hash_to_filename', 'save_fetchable_model',
-           'load_model']
+           'load_model', 'freeze_', 'unfreeze_', 'freeze_submodules_', 'unfreeze_submodules_']
 
 
 def copy_script(dst, no_script_okay=True, frame=None, verbose=False):
@@ -42,6 +42,7 @@ def copy_script(dst, no_script_okay=True, frame=None, verbose=False):
     Args:
         dst: Copy destination. Filename or folder.
         no_script_okay: If ``False`` raise ``FileNotFoundError`` if no script is found.
+        frame: Context frame.
         verbose: Whether to print source and destination when copying.
 
     """
@@ -886,7 +887,7 @@ def count_submodules(module: nn.Module, class_or_tuple) -> int:
     Returns:
         Number of submodules.
     """
-    return np.sum([1 for m in module.modules() if isinstance(m, class_or_tuple)])
+    return int(np.sum([1 for m in module.modules() if isinstance(m, class_or_tuple)]))
 
 
 def ensure_num_tuple(v, num=2, msg=''):
@@ -996,6 +997,15 @@ class GpuStats:
             util=Percent(uti.gpu)
         )
 
+    def dict(self, byte_lvl=3, prefix='gpu'):
+        d = {}
+        for i, stat in self:
+            for k, v in stat.items():
+                if isinstance(v, Bytes):
+                    v = np.round(float(v) / (2 ** (10 * byte_lvl)), 2)
+                d[f'{prefix}{i}-{k}'] = float(v)
+        return d
+
     def __str__(self):
         deli = self.delimiter
         return deli.join([f'gpu{i}({deli.join([f"{k}: {v}" for k, v in stat.items()])})' for i, stat in self])
@@ -1042,36 +1052,53 @@ class Tiling:
 def get_tiling_slices(
         size: Sequence[int],
         crop_size: Union[int, Sequence[int]],
-        strides: Union[int, Sequence[int]]
-) -> Union[Iterable[slice], Tuple[int]]:
+        strides: Union[int, Sequence[int]],
+        return_overlaps=False
+) -> Union[
+    Tuple[Iterable[slice], Tuple[int]],
+    Tuple[Iterable[slice], Iterable[Tuple[int]], Tuple[int]]
+]:
     """Get tiling slices.
 
     Args:
         size: Reference size as tuple.
         crop_size: Crop size.
         strides: Strides.
+        return_overlaps: Whether to return overlaps.
 
     Returns:
         Iterable[slice], Tuple[int]:
             Iterator of tiling slices (each slice defining a tile),
             Number of tiles per dimension as tuple.
+        Iterable[slice], Iterable[Tuple[int]], Tuple[int]:
+            Iterator of tiling slices (each slice defining a tile),
+            Iterator of overlaps (overlaps with adjacent tiles for each tile),
+            Number of tiles per dimension as tuple.
     """
     assert isinstance(size, (tuple, list))
     crop_size = ensure_num_tuple(crop_size, len(size))
     strides = ensure_num_tuple(strides, len(size))
-    slices, shape = [], []
+    slices, shape, overlaps = [], [], []
     for axis in range(len(size)):
         if crop_size[axis] >= size[axis]:
             tl = [size[axis]]
         else:
-            tl = range(crop_size[axis], max(2, 1 + int(np.ceil(size[axis] / strides[axis]))) * strides[axis],
+            tl = range(crop_size[axis],
+                       1 + crop_size[axis] + (int(np.ceil((size[axis] - crop_size[axis]) / strides[axis]))) *
+                       strides[axis],
                        strides[axis])
-        axis_slices = []
-        for t in tl:
-            stop = min(t, size[axis])
-            axis_slices.append(slice(max(0, stop - crop_size[axis]), stop))
-        slices.append(axis_slices), shape.append(len(tl))
-    return product(*slices), shape
+        stops = np.minimum(tl, size[axis])
+        starts = np.maximum(0, stops - crop_size[axis])
+        overlaps_start = np.concatenate((starts[:1], stops[:-1])) - starts
+        axis_slices, axis_overlaps = [], []
+        for a, b, *ov in zip(starts, stops, overlaps_start, np.concatenate((overlaps_start[1:], [0]))):
+            axis_slices.append(slice(a, b))
+            axis_overlaps.append(ov)
+        slices.append(axis_slices), shape.append(len(starts)), overlaps.append(axis_overlaps)
+    slices = product(*slices)
+    if return_overlaps:
+        return slices, product(*overlaps), shape
+    return slices, shape
 
 
 def to_h5(filename, mode='w', chunks=None, compression=None, overwrite=False, create_dataset_kw: dict = None,
@@ -1118,6 +1145,8 @@ def from_h5(filename, *keys, **keys_slices):
         Data from hdf5 file. As tuple if multiple keys are provided.
     """
     with h5py.File(filename, 'r') as h:
+        if len(keys) == 0:
+            print('Available keys:', list(h.keys()), flush=True)
         res = tuple(h[k][:] for k in keys) + tuple(h[k][v] for k, v in keys_slices.items())
     if len(res) == 1:
         res, = res
@@ -1278,3 +1307,69 @@ def update_dict_(dst, src, override=False, keys: Union[List[str], Tuple[str]] = 
             continue
         if override or k not in dst:
             dst[k] = v
+
+
+def freeze_(module: "nn.Module", recurse=True):
+    """Freeze.
+
+    Freezes a module by setting `param.requires_grad=False` and calling `module.eval()`.
+
+    Args:
+        module: Module.
+        recurse: Whether to freeze parameters of this layer and submodules or only parameters that are direct members
+            of this module.
+    """
+    for param in module.parameters(recurse=recurse):
+        param.requires_grad = False
+    module.eval()
+
+
+def unfreeze_(module: "nn.Module", recurse=True):
+    """Unfreeze.
+
+    Unfreezes a module by setting `param.requires_grad=True` and calling `module.train()`.
+
+    Args:
+        module: Module.
+        recurse: Whether to unfreeze parameters of this layer and submodules or only parameters that are direct members
+            of this module.
+    """
+    for param in module.parameters(recurse=recurse):
+        param.requires_grad = False
+    module.train()
+
+
+def freeze_submodules_(module: "nn.Module", *names, recurse=True):
+    """Freeze specific submodules.
+
+    Freezes submodules by setting `param.requires_grad=False` and calling `submodule.eval()`.
+
+    Args:
+        module: Module.
+        names: Names of submodules.
+        recurse: Whether to freeze parameters of specified modules and their respective submodules or only parameters
+            that are direct members of the specified submodules.
+    """
+    assert len(names), 'Specify at least one submodule by name.'
+    if len(names) == 1 and isinstance(names[0], (tuple, list)):
+        names, = names
+    for n in names:
+        freeze_(module.get_submodule(n), recurse=recurse)
+
+
+def unfreeze_submodules_(module: "nn.Module", *names, recurse=True):
+    """Unfreeze specific submodules.
+
+    Unfreezes submodules by setting `param.requires_grad=True` and calling `submodule.train()`.
+
+    Args:
+        module: Module.
+        names: Names of submodules.
+        recurse: Whether to unfreeze parameters of specified modules and their respective submodules or only parameters
+            that are direct members of the specified submodules.
+    """
+    assert len(names), 'Specify at least one submodule by name.'
+    if len(names) == 1 and isinstance(names[0], (tuple, list)):
+        names, = names
+    for n in names:
+        unfreeze_(module.get_submodule(n), recurse=recurse)
